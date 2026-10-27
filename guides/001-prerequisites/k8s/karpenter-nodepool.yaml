@@ -1,0 +1,278 @@
+# Karpenter NodePools — llms-on-eks
+# Apply: kubectl apply -f k8s/karpenter-nodepool.yaml
+#
+# ⚠️  IMPORTANT: The role: field in each EC2NodeClass references
+#     "KarpenterNodeRole-llms-on-eks" by name.
+#     If you changed CLUSTER_NAME, use deploy.sh (it runs sed substitution):
+#       bash guides/001-prerequisites/scripts/deploy.sh
+#     Or substitute manually before applying:
+#       sed "s/llms-on-eks/YOUR-CLUSTER-NAME/g" k8s/karpenter-nodepool.yaml | kubectl apply -f -
+#
+# Resources created:
+#   EC2NodeClass default  — standard CPU nodes (system + cpu NodePools)
+#   EC2NodeClass gpu      — GPU nodes (200Gi root disk for vLLM container images)
+#   NodePool    system    — always-on support workloads  (t3.medium/large)
+#   NodePool    cpu       — on-demand CPU inference      (t3.xlarge/2xlarge, m6i)
+#   NodePool    gpu       — on-demand GPU inference      (g5/g4dn)
+#   NodePool    gpu-spot  — spot GPU (load testing)      (g5/g4dn spot)
+
+---
+###########################################################################
+# EC2NodeClass: default  (system + cpu NodePools)
+###########################################################################
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  # Matches the IAM role created by CloudFormation: KarpenterNodeRole-{clusterName}
+  role: "KarpenterNodeRole-llms-on-eks"
+  amiSelectorTerms:
+    - alias: "al2023@latest"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "llms-on-eks"
+  securityGroupSelectorTerms:
+    # Our custom node SG (tagged for Karpenter discovery)
+    - tags:
+        karpenter.sh/discovery: "llms-on-eks"
+    # EKS cluster SG — MUST be included so Karpenter nodes can communicate
+    # with CoreDNS and other pods on system nodes (same SG = same security group rules)
+    - tags:
+        aws:eks:cluster-name: "llms-on-eks"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeType: gp3
+        volumeSize: 80Gi
+        deleteOnTermination: true
+  tags:
+    project: llms-on-eks
+    managed-by: karpenter
+
+---
+###########################################################################
+# EC2NodeClass: gpu  (gpu + gpu-spot NodePools)
+# Larger disk: vLLM Docker image is ~20GB; model weights on EFS in later guides
+###########################################################################
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu
+spec:
+  role: "KarpenterNodeRole-llms-on-eks"
+  amiSelectorTerms:
+    - alias: "al2023@latest"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "llms-on-eks"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "llms-on-eks"
+    - tags:
+        aws:eks:cluster-name: "llms-on-eks"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeType: gp3
+        volumeSize: 200Gi    # vLLM image (~20GB) + OS + buffer
+        iops: 4000
+        throughput: 1000
+        deleteOnTermination: true
+  tags:
+    project: llms-on-eks
+    managed-by: karpenter
+    node-type: gpu
+
+---
+###########################################################################
+# NodePool: system
+# Purpose:  CoreDNS, aws-node, Karpenter controller, Prometheus, Grafana
+# Instances: t3.medium / t3.large — cheap, always available
+# Lifecycle: Never expire, consolidate when underutilized
+###########################################################################
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: system
+spec:
+  template:
+    metadata:
+      labels:
+        node-type: system
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - t3.medium     # 2 vCPU  4GB  — $0.04/hr
+            - t3.large      # 2 vCPU  8GB  — $0.08/hr
+            - t3.xlarge     # 4 vCPU 16GB  — $0.17/hr
+      expireAfter: Never
+  limits:
+    cpu: 32
+    memory: 64Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+
+---
+###########################################################################
+# NodePool: cpu
+# Purpose:  Guide 002 — vLLM CPU inference
+# Instances: t3.xlarge/2xlarge, m6i.xlarge/2xlarge
+# Cost:      t3.xlarge = $0.17/hr, t3.2xlarge = $0.33/hr
+# Notes:     m6i has AVX-512 BF16 which vLLM uses for faster CPU inference
+###########################################################################
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: cpu
+spec:
+  template:
+    metadata:
+      labels:
+        node-type: cpu
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - t3.xlarge     # 4 vCPU  16GB  $0.17/hr — Llama 3.2 3B BF16 (~7GB)
+            - t3.2xlarge    # 8 vCPU  32GB  $0.33/hr — Mistral 7B BF16  (~15GB)
+            - m6i.xlarge    # 4 vCPU  16GB  $0.19/hr — AVX-512, faster vLLM CPU
+            - m6i.2xlarge   # 8 vCPU  32GB  $0.38/hr — best CPU option for 7B models
+      expireAfter: 24h
+  limits:
+    cpu: 32
+    memory: 128Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 10m
+
+---
+###########################################################################
+# NodePool: gpu  (on-demand)
+# Purpose:  Guide 003+ — vLLM GPU inference, NVIDIA GPU Operator
+# Instances: g5/g4dn family
+# Cost:      g5.xlarge = $1.01/hr, g5.12xlarge = $5.67/hr
+# Notes:     Tainted so only pods with nvidia.com/gpu toleration land here
+###########################################################################
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu
+spec:
+  template:
+    metadata:
+      labels:
+        node-type: gpu
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu
+      # Taint prevents non-GPU pods from being scheduled here
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - g5.xlarge     # 1x A10G 24GB VRAM   $1.01/hr — Llama 3.1 8B  (Guide 003)
+            - g5.2xlarge    # 1x A10G 24GB VRAM   $1.21/hr — more CPU/RAM headroom
+            - g5.12xlarge   # 4x A10G 96GB VRAM   $5.67/hr — Llama 70B tensor-parallel
+            - g4dn.xlarge   # 1x T4  16GB VRAM    $0.53/hr — budget GPU option
+            - g4dn.2xlarge  # 1x T4  16GB VRAM    $0.75/hr — budget + more CPU/RAM
+      expireAfter: 720h  # 30 days — node will be replaced with fresh AMI
+  limits:
+    nvidia.com/gpu: 16   # max 16 GPUs across this NodePool at once
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+
+---
+###########################################################################
+# NodePool: gpu-spot  (spot instances — ~70% cheaper)
+# Purpose:  Guide 009 — load testing, batch inference, cost optimisation
+# Notes:    Spot can be interrupted with 2-min warning.
+#           Karpenter drains pods gracefully on interruption (via SQS queue).
+###########################################################################
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-spot
+spec:
+  template:
+    metadata:
+      labels:
+        node-type: gpu-spot
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - g5.xlarge     # ~$0.30/hr spot (70% saving vs on-demand)
+            - g5.2xlarge    # ~$0.36/hr spot
+            - g4dn.xlarge   # ~$0.16/hr spot
+            - g4dn.2xlarge  # ~$0.22/hr spot
+      expireAfter: 720h
+  limits:
+    nvidia.com/gpu: 8
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s   # fast consolidation — spot nodes are transient

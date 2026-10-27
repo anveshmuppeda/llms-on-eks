@@ -1,0 +1,922 @@
+# Author: Anvesh Muppeda
+# Repo:   llms-on-eks
+# Guide:  001 — Prerequisites & Cluster Setup
+#
+# ⚠️  LEARNING / CONCEPT GUIDE — NOT FOR PRODUCTION
+# IAM roles use broad managed policies and open resource scopes for clarity.
+# Security groups allow all traffic within VPC to avoid blocking EKS pod communication.
+# Tighten for production: scope IAM to specific resources, restrict SG ingress/egress.
+#
+# What this creates:
+#   VPC (10.20.0.0/16) — 2 public subnets, 2 private subnets, NAT GW, IGW
+#   EKS 1.32 — public+private endpoint, all logging enabled
+#   System Managed Node Group — 2× t3.medium, AL2023, private subnets
+#   EKS Add-ons — vpc-cni, coredns, kube-proxy, ebs-csi (with IRSA), efs-csi, pod-identity
+#   OIDC Provider — for IRSA (EBS CSI + Karpenter)
+#   Karpenter IAM — node role, controller policy, IRSA controller role
+#   Karpenter EKS Access Entry — replaces aws-auth ConfigMap editing
+#   SQS Interruption Queue — spot + health events with long-polling
+#   EventBridge Rules — spot interrupt, rebalance, health, state-change → SQS
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  EKS 1.32 cluster with Karpenter for the LLMs on EKS guide series.
+  Broad IAM permissions and open-VPC security groups for a hands-on learning environment.
+
+Parameters:
+
+  ProjectTag:
+    Description: Tag applied to all resources
+    Type: String
+    Default: llms-on-eks
+
+  EKSClusterName:
+    Type: String
+    Description: EKS cluster name - must be unique in the region
+    Default: llms-on-eks
+
+  VpcCIDR:
+    Type: String
+    Default: 10.20.0.0/16
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.20.1.0/24
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.20.2.0/24
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.20.10.0/24
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.20.11.0/24
+
+  SystemNodeInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, t3.xlarge]
+
+  SystemNodeDesiredSize:
+    Type: Number
+    Default: 2
+
+  SystemNodeMinSize:
+    Type: Number
+    Default: 2
+
+  SystemNodeMaxSize:
+    Type: Number
+    Default: 4
+
+Resources:
+
+  ############################################################################
+  # VPC
+  ############################################################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-vpc"
+        - Key: project
+          Value: !Ref ProjectTag
+
+  ############################################################################
+  # Internet Gateway
+  ############################################################################
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-igw"
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+
+  ############################################################################
+  # Public Subnets  (ALB lives here)
+  ############################################################################
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-public-1"
+        - Key: project
+          Value: !Ref ProjectTag
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-public-2"
+        - Key: project
+          Value: !Ref ProjectTag
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+
+  ############################################################################
+  # Private Subnets  (EKS nodes + Karpenter-provisioned nodes live here)
+  # Tagged with karpenter.sh/discovery so EC2NodeClass can find them
+  ############################################################################
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-private-1"
+        - Key: project
+          Value: !Ref ProjectTag
+        - Key: karpenter.sh/discovery
+          Value: !Ref EKSClusterName
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-private-2"
+        - Key: project
+          Value: !Ref ProjectTag
+        - Key: karpenter.sh/discovery
+          Value: !Ref EKSClusterName
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+
+  ############################################################################
+  # NAT Gateway  (private nodes need outbound internet for image pulls)
+  ############################################################################
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: IGWAttachment
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-nat"
+
+  ############################################################################
+  # Route Tables
+  ############################################################################
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PublicSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-private-rt"
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  ############################################################################
+  # NACLs — allow-all (concept guide; EKS needs broad ephemeral port access)
+  ############################################################################
+  PublicNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub "${EKSClusterName}-public-nacl"}]
+
+  PublicNACLInbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PublicNACLOutbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 100
+      Protocol: -1
+      Egress: true
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PublicSubnet1NACLAssoc:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      NetworkAclId: !Ref PublicNACL
+
+  PublicSubnet2NACLAssoc:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      NetworkAclId: !Ref PublicNACL
+
+  PrivateNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub "${EKSClusterName}-private-nacl"}]
+
+  PrivateNACLInbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNACL
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PrivateNACLOutbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNACL
+      RuleNumber: 100
+      Protocol: -1
+      Egress: true
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PrivateSubnet1NACLAssoc:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      NetworkAclId: !Ref PrivateNACL
+
+  PrivateSubnet2NACLAssoc:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      NetworkAclId: !Ref PrivateNACL
+
+  ############################################################################
+  # Security Groups
+  #
+  # Learning guide policy: allow all traffic within VPC.
+  # This avoids any port-blocking surprises while learning EKS + vLLM.
+  # Production hardening: restrict to specific ports per component.
+  ############################################################################
+
+  # Control plane SG — EKS-managed; we just need to create and reference it
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS control plane security group
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-cp-sg"
+        - Key: project
+          Value: !Ref ProjectTag
+
+  # Node SG — all traffic within VPC allowed (simplest for a learning env)
+  # Self-referencing node-to-node rule added as a separate resource (CFN requirement)
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS worker nodes - all VPC traffic allowed for learning environment
+      VpcId: !Ref VPC
+      # Allow all inbound traffic from within the VPC CIDR
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: !Ref VpcCIDR
+          Description: Allow all traffic from within VPC (learning env)
+      # Allow all outbound traffic
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "${EKSClusterName}-node-sg"
+        - Key: project
+          Value: !Ref ProjectTag
+        # Required: Karpenter securityGroupSelectorTerms matches on this tag
+        - Key: karpenter.sh/discovery
+          Value: !Ref EKSClusterName
+
+  # Allow node-to-node traffic (separate resource — CFN cannot self-reference inline)
+  NodeSGIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow all node-to-node traffic
+
+  # Allow all traffic from control plane to nodes
+  NodeSGIngressFromCP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ControlPlaneSecurityGroup
+      Description: Allow all from EKS control plane
+
+  # Allow nodes to reach the control plane API server (webhooks, metrics)
+  CPSGIngressFromNodes:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ControlPlaneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow HTTPS from worker nodes to control plane
+
+  ############################################################################
+  # IAM — EKS Control Plane Role
+  ############################################################################
+  ControlPlaneRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EKSClusterName}-control-plane-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  ############################################################################
+  # IAM — System Node Group Role
+  # Broad policies — learning guide; no least-privilege restrictions
+  ############################################################################
+  NodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EKSClusterName}-nodegroup-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+        # Broad: allows EC2 describe actions needed for Karpenter node discovery
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  ############################################################################
+  # IAM — EBS CSI Driver Service Account Role (IRSA)
+  # Required by aws-ebs-csi-driver add-on to create/attach/detach EBS volumes
+  ############################################################################
+  EBSCSIRole:
+    Type: AWS::IAM::Role
+    DependsOn: OIDCProvider
+    Properties:
+      RoleName: !Sub "${EKSClusterName}-ebs-csi-role"
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": { "Federated": "${OIDCArn}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${OIDCHost}:aud": "sts.amazonaws.com",
+                  "${OIDCHost}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa"
+                }
+              }
+            }]
+          }
+        - OIDCArn: !GetAtt OIDCProvider.Arn
+          OIDCHost: !Select [1, !Split ["//", !GetAtt EKSCluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  ############################################################################
+  # EKS Cluster
+  ############################################################################
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref EKSClusterName
+      Version: "1.32"
+      RoleArn: !GetAtt ControlPlaneRole.Arn
+      AccessConfig:
+        # API_AND_CONFIG_MAP is required for AWS::EKS::AccessEntry resources (Karpenter node access entry).
+        # Default mode (CONFIG_MAP) does not support the Access Entry API.
+        AuthenticationMode: API_AND_CONFIG_MAP
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: project
+          Value: !Ref ProjectTag
+
+  ############################################################################
+  # OIDC Provider — required for IRSA (EBS CSI + Karpenter controller)
+  ############################################################################
+  OIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    DependsOn: EKSCluster
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+
+  ############################################################################
+  # EKS Add-ons
+  # vpc-cni must come first; coredns/storage drivers need a running node
+  ############################################################################
+  AddonVpcCni:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      AddonName: vpc-cni
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+
+  AddonKubeProxy:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      AddonName: kube-proxy
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+
+  AddonPodIdentity:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      AddonName: eks-pod-identity-agent
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+
+  AddonCoreDns:
+    Type: AWS::EKS::Addon
+    DependsOn: SystemNodeGroup
+    Properties:
+      AddonName: coredns
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+
+  AddonEbsCsi:
+    Type: AWS::EKS::Addon
+    DependsOn:
+      - SystemNodeGroup
+      - EBSCSIRole
+    Properties:
+      AddonName: aws-ebs-csi-driver
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+      ServiceAccountRoleArn: !GetAtt EBSCSIRole.Arn
+
+  AddonEfsCsi:
+    Type: AWS::EKS::Addon
+    DependsOn: SystemNodeGroup
+    Properties:
+      AddonName: aws-efs-csi-driver
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+
+  ############################################################################
+  # System Managed Node Group
+  # t3.medium × 2 — always-on, private subnets
+  # Hosts: kube-system, CoreDNS, aws-node, Karpenter controller
+  # NO taint — CoreDNS and aws-node cannot tolerate custom taints
+  ############################################################################
+  SystemNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn:
+      - AddonVpcCni
+      - AddonKubeProxy
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: !Sub "${EKSClusterName}-system"
+      NodeRole: !GetAtt NodeGroupRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !Ref SystemNodeInstanceType
+      ScalingConfig:
+        DesiredSize: !Ref SystemNodeDesiredSize
+        MinSize:     !Ref SystemNodeMinSize
+        MaxSize:     !Ref SystemNodeMaxSize
+      AmiType:  AL2023_x86_64_STANDARD
+      DiskSize:  50
+      Version:  "1.32"
+      Labels:
+        role:      system
+        node-type: system
+      Tags:
+        Name:    !Sub "${EKSClusterName}-system-nodegroup"
+        project: !Ref ProjectTag
+
+  ############################################################################
+  # Karpenter IAM — Node Role
+  # Must be named exactly: KarpenterNodeRole-{clusterName}
+  # Broad: includes AdministratorAccess is intentionally excluded;
+  # but ECR, SSM, EKS worker, and CNI are included for learning.
+  ############################################################################
+  KarpenterNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "KarpenterNodeRole-${EKSClusterName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "ec2.${AWS::URLSuffix}"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        # Broad: EC2 read-only so nodes can describe their own environment
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+
+  ############################################################################
+  # Karpenter IAM — Controller Managed Policy
+  # Covers the full Karpenter v1.1.x permission set.
+  # Resource scoping is kept broad (wildcards) for a learning guide.
+  ############################################################################
+  KarpenterControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "KarpenterControllerPolicy-${EKSClusterName}"
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EC2InstanceProvisioning",
+              "Effect": "Allow",
+              "Resource": "*",
+              "Action": [
+                "ec2:RunInstances",
+                "ec2:CreateFleet",
+                "ec2:CreateLaunchTemplate",
+                "ec2:TerminateInstances",
+                "ec2:DeleteLaunchTemplate",
+                "ec2:CreateTags"
+              ]
+            },
+            {
+              "Sid": "EC2ReadActions",
+              "Effect": "Allow",
+              "Resource": "*",
+              "Action": [
+                "ec2:DescribeAvailabilityZones",
+                "ec2:DescribeCapacityReservations",
+                "ec2:DescribeImages",
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceTypeOfferings",
+                "ec2:DescribeInstanceTypes",
+                "ec2:DescribeLaunchTemplates",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeSpotPriceHistory",
+                "ec2:DescribeSubnets"
+              ]
+            },
+            {
+              "Sid": "IAMInstanceProfile",
+              "Effect": "Allow",
+              "Resource": "*",
+              "Action": [
+                "iam:CreateInstanceProfile",
+                "iam:TagInstanceProfile",
+                "iam:AddRoleToInstanceProfile",
+                "iam:RemoveRoleFromInstanceProfile",
+                "iam:DeleteInstanceProfile",
+                "iam:GetInstanceProfile",
+                "iam:ListInstanceProfiles",
+                "iam:PassRole"
+              ]
+            },
+            {
+              "Sid": "SSMAndPricing",
+              "Effect": "Allow",
+              "Resource": "*",
+              "Action": [
+                "ssm:GetParameter",
+                "pricing:GetProducts"
+              ]
+            },
+            {
+              "Sid": "SQSInterruptionQueue",
+              "Effect": "Allow",
+              "Resource": "${KarpenterInterruptionQueue.Arn}",
+              "Action": [
+                "sqs:DeleteMessage",
+                "sqs:GetQueueUrl",
+                "sqs:ReceiveMessage"
+              ]
+            },
+            {
+              "Sid": "EKSClusterAccess",
+              "Effect": "Allow",
+              "Resource": "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EKSClusterName}",
+              "Action": "eks:DescribeCluster"
+            }
+          ]
+        }
+
+  ############################################################################
+  # Karpenter IAM — Controller Role (IRSA — kube-system:karpenter SA)
+  ############################################################################
+  KarpenterControllerRole:
+    Type: AWS::IAM::Role
+    DependsOn: OIDCProvider
+    Properties:
+      RoleName: !Sub "KarpenterControllerRole-${EKSClusterName}"
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": { "Federated": "${OIDCArn}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${OIDCHost}:aud": "sts.amazonaws.com",
+                  "${OIDCHost}:sub": "system:serviceaccount:kube-system:karpenter"
+                }
+              }
+            }]
+          }
+        - OIDCArn: !GetAtt OIDCProvider.Arn
+          OIDCHost: !Select [1, !Split ["//", !GetAtt EKSCluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - !Ref KarpenterControllerPolicy
+
+  ############################################################################
+  # Karpenter EKS Access Entry
+  # Registers KarpenterNodeRole as valid EC2_LINUX node identity.
+  # Replaces manual aws-auth ConfigMap editing.
+  ############################################################################
+  KarpenterNodeAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt KarpenterNodeRole.Arn
+      Type: EC2_LINUX
+
+  ############################################################################
+  # Karpenter SQS Interruption Queue
+  # Name must exactly match EKSClusterName (Karpenter convention)
+  # Long-polling (20s) reduces empty ReceiveMessage calls
+  ############################################################################
+  KarpenterInterruptionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref EKSClusterName
+      MessageRetentionPeriod: 300
+      SqsManagedSseEnabled: true
+      ReceiveMessageWaitTimeSeconds: 20
+
+  KarpenterInterruptionQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref KarpenterInterruptionQueue
+      PolicyDocument:
+        Statement:
+          - Sid: AllowEventBridgeAndSQS
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - sqs.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt KarpenterInterruptionQueue.Arn
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: sqs:*
+            Resource: !GetAtt KarpenterInterruptionQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ############################################################################
+  # EventBridge Rules → SQS  (4 rules for complete interruption coverage)
+  ############################################################################
+  HealthEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${EKSClusterName}-health-event"
+      EventPattern:
+        source: [aws.health]
+        detail-type: [AWS Health Event]
+      Targets:
+        - Id: KarpenterQueue
+          Arn: !GetAtt KarpenterInterruptionQueue.Arn
+
+  SpotInterruptionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${EKSClusterName}-spot-interruption"
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Spot Instance Interruption Warning]
+      Targets:
+        - Id: KarpenterQueue
+          Arn: !GetAtt KarpenterInterruptionQueue.Arn
+
+  RebalanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${EKSClusterName}-rebalance"
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Instance Rebalance Recommendation]
+      Targets:
+        - Id: KarpenterQueue
+          Arn: !GetAtt KarpenterInterruptionQueue.Arn
+
+  InstanceStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${EKSClusterName}-state-change"
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Instance State-change Notification]
+      Targets:
+        - Id: KarpenterQueue
+          Arn: !GetAtt KarpenterInterruptionQueue.Arn
+
+############################################################################
+# Outputs — exported so other guides can import without hardcoding
+############################################################################
+Outputs:
+
+  ClusterName:
+    Description: EKS cluster name
+    Value: !Ref EKSClusterName
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ClusterEndpoint:
+    Description: EKS API server endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+
+  OIDCIssuerUrl:
+    Description: OIDC issuer URL - use when creating IRSA roles in later guides
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-OIDCIssuerUrl"
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  VpcCIDR:
+    Description: VPC CIDR block
+    Value: !Ref VpcCIDR
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcCIDR"
+
+  PrivateSubnet1Id:
+    Description: Private subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet1"
+
+  PrivateSubnet2Id:
+    Description: Private subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet2"
+
+  NodeSecurityGroupId:
+    Description: Worker node security group ID
+    Value: !GetAtt NodeSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeSgId"
+
+  KarpenterNodeRoleArn:
+    Description: Karpenter node IAM role ARN - referenced in EC2NodeClass.spec.role
+    Value: !GetAtt KarpenterNodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KarpenterNodeRoleArn"
+
+  KarpenterControllerRoleArn:
+    Description: Karpenter controller IRSA role ARN - used in Helm serviceAccount annotation
+    Value: !GetAtt KarpenterControllerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KarpenterControllerRoleArn"
+
+  KarpenterInterruptionQueueName:
+    Description: SQS queue name for Karpenter spot interruption handling
+    Value: !GetAtt KarpenterInterruptionQueue.QueueName
+    Export:
+      Name: !Sub "${AWS::StackName}-KarpenterQueueName"
