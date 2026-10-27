@@ -14,6 +14,8 @@ once in Guide 001 — every subsequent guide deploys a new workload on top of it
 
 ---
 
+![Banner](./static/banner/LLMs%20on%20EKS_%20Neon%20AI%20Infrastructure.png)
+
 ## Quick Start
 
 ```bash
