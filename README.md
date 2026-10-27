@@ -155,14 +155,6 @@ llms-on-eks/
 │   ├── 002-cpu-inference-vllm/
 │   │   ├── k8s/                      ← vllm-cpu.yaml
 │   │   └── scripts/                  ← deploy.sh / test.sh
-│   └── 003-gpu-inference-vllm/
-│       ├── k8s/                      ← vllm-gpu.yaml
-│       └── scripts/                  ← deploy.sh / test.sh
-│
-└── docs/                             ← GitHub setup, LinkedIn posts, banner prompt
-    ├── github-setup.md
-    ├── linkedin-post.md
-    └── banner-prompt.md
 ```
 
 ---
